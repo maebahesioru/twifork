@@ -5377,23 +5377,44 @@ class Client:
 
         notifications = []
 
-        for notification in global_objects.get('notifications', {}).values():
-            user_actions = notification['template']['aggregateUserActionsV1']
-            target_objects = user_actions['targetObjects']
-            if target_objects and 'tweet' in target_objects[0]:
-                tweet_id = target_objects[0]['tweet']['id']
-                tweet = tweets[tweet_id]
-            else:
-                tweet = None
+        raw_notifications = global_objects.get('notifications')
+        if raw_notifications:
+            for notification in raw_notifications.values():
+                user_actions = notification['template']['aggregateUserActionsV1']
+                target_objects = user_actions['targetObjects']
+                if target_objects and 'tweet' in target_objects[0]:
+                    tweet_id = target_objects[0]['tweet']['id']
+                    tweet = tweets[tweet_id]
+                else:
+                    tweet = None
 
-            from_users  = user_actions['fromUsers']
-            if from_users and 'user' in from_users[0]:
-                user_id = from_users[0]['user']['id']
-                user = users[user_id]
-            else:
-                user = None
+                from_users  = user_actions['fromUsers']
+                if from_users and 'user' in from_users[0]:
+                    user_id = from_users[0]['user']['id']
+                    user = users[user_id]
+                else:
+                    user = None
 
-            notifications.append(Notification(self, notification, tweet, user))
+                notifications.append(Notification(self, notification, tweet, user))
+        else:
+            # The Mentions timeline omits the `notifications` key entirely:
+            # the mention/reply tweets themselves are listed in
+            # `globalObjects.tweets`. Build a Notification per tweet so
+            # `get_notifications('Mentions')` returns them instead of []. 
+            for tweet in tweets.values():
+                user = tweet.user
+                message = {'text': ''}
+                if user is not None:
+                    message = {
+                        'text': f'@{user.screen_name}さんがあなたに返信/メンションしました'
+                    }
+                data = {
+                    'id': tweet.id,
+                    'timestampMs': '0',
+                    'icon': {},
+                    'message': message,
+                }
+                notifications.append(Notification(self, data, tweet, user))
 
         entries = first_dict(response, 'entries', [])
         cursor_bottom_entry = [
