@@ -5378,7 +5378,7 @@ class Client:
         notifications = []
 
         raw_notifications = global_objects.get('notifications')
-        if raw_notifications:
+        if raw_notifications is not None:
             for notification in raw_notifications.values():
                 user_actions = notification['template']['aggregateUserActionsV1']
                 target_objects = user_actions['targetObjects']
@@ -5396,23 +5396,33 @@ class Client:
                     user = None
 
                 notifications.append(Notification(self, notification, tweet, user))
-        else:
+        elif type == 'Mentions':
             # The Mentions timeline omits the `notifications` key entirely:
-            # the mention/reply tweets themselves are listed in
-            # `globalObjects.tweets`. Build a Notification per tweet so
-            # `get_notifications('Mentions')` returns them instead of []. 
-            for tweet in tweets.values():
+            # the mention/reply tweets are referenced by `tweet-*` timeline
+            # entries and stored in `globalObjects.tweets` alongside context
+            # tweets. Only convert the entry tweets, not the whole object map.
+            entries = first_dict(response, 'entries', [])
+            seen_tweet_ids = set()
+            for entry in entries:
+                entry_id = entry.get('entryId', '')
+                if not entry_id.startswith('tweet-'):
+                    continue
+                tweet_id = entry_id.removeprefix('tweet-')
+                if tweet_id in seen_tweet_ids:
+                    continue
+                tweet = tweets.get(tweet_id)
+                if tweet is None:
+                    continue
+                seen_tweet_ids.add(tweet_id)
                 user = tweet.user
-                message = {'text': ''}
-                if user is not None:
-                    message = {
-                        'text': f'@{user.screen_name}さんがあなたに返信/メンションしました'
-                    }
+                # Tweet ids are snowflakes; recover the creation time without
+                # inventing a timestamp or depending on locale-formatted text.
+                timestamp_ms = (int(tweet.id) >> 22) + 1288834974657
                 data = {
                     'id': tweet.id,
-                    'timestampMs': '0',
+                    'timestampMs': str(timestamp_ms),
                     'icon': {},
-                    'message': message,
+                    'message': {'text': ''},
                 }
                 notifications.append(Notification(self, data, tweet, user))
 
