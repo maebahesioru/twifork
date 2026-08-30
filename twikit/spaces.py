@@ -246,15 +246,25 @@ class ChatMessage:
         body = payload.get('body')
         text = None
         kind = None
+        parsed_body = None
         if isinstance(body, str):
             try:
-                parsed = json.loads(body)
+                parsed_body = json.loads(body)
             except json.JSONDecodeError:
-                parsed = None
-            if isinstance(parsed, dict):
-                # system event (join/leave/follow…) — body is a JSON object
-                text = None
-                kind = parsed.get('type') or 'event'
+                parsed_body = None
+            if isinstance(parsed_body, dict):
+                # Normal chat messages also encode their body as a JSON
+                # object.  Only objects without a textual payload are
+                # control/system events.
+                text = (
+                    parsed_body.get('body')
+                    or parsed_body.get('text')
+                    or parsed_body.get('message')
+                )
+                if text is not None:
+                    kind = parsed_body.get('type') or 'text'
+                else:
+                    kind = parsed_body.get('type') or 'event'
             else:
                 text = body
                 kind = 'text'
@@ -272,8 +282,14 @@ class ChatMessage:
             or ('message' if raw.get('kind') in (1, 2) else 'message'),
             sender=payload.get('sender') or raw.get('sender'),
             body=str(text) if text is not None else None,
-            timestamp=raw.get('timestamp'),
-            session_uuid=payload.get('session_uuid'),
+            timestamp=raw.get('timestamp') or payload.get('timestamp'),
+            session_uuid=(
+                payload.get('session_uuid')
+                or (
+                    parsed_body.get('session_uuid')
+                    if isinstance(parsed_body, dict) else None
+                )
+            ),
             kind=kind,
         )
 
@@ -590,6 +606,10 @@ class ChatmanApi:
 
     async def initialize(self, chat_access_token: str | None = None) -> None:
         if self._initialized:
+            # The guest-service authorization is account-scoped, but the
+            # chat access token changes when entering/reconnecting a Space.
+            if chat_access_token is not None:
+                self._chat_access_token = chat_access_token
             return
         resp = await self._proxsee.get_token_for_service('guest')
         token = resp.get('authorization_token')
@@ -751,12 +771,12 @@ class ChatmanApi:
             'twitter_user_ids': twitter_user_ids,
         })
 
-    async def add_admin(self, broadcast_id: str, session_uuid: str,
-                        twitter_user_id: str) -> dict:
+    async def add_admin(
+        self, broadcast_id: str, twitter_user_id: str
+    ) -> dict:
         return await self._post('audiospace/admin/addAdmin', {
             **_ntp_metadata(),
             'broadcast_id': broadcast_id,
-            'session_uuid': session_uuid,
             'twitter_user_id': twitter_user_id,
         })
 
@@ -787,10 +807,27 @@ class ChatmanApi:
             'session_uuid': session_uuid,
         })
 
-    async def stream_eject(self, session_uuid: str) -> dict:
+    async def stream_eject(
+        self,
+        session_uuid: str,
+        *,
+        webrtc_handle_id: int,
+        webrtc_session_id: int,
+        janus_room_id: str,
+        janus_participant_id: int,
+    ) -> dict:
+        """Eject an active publisher from the Janus audio stream.
+
+        X requires both Chatman and Janus identifiers. Sending only the
+        session UUID is rejected with HTTP 400.
+        """
         return await self._post('audiospace/stream/eject', {
             **_ntp_metadata(),
             'session_uuid': session_uuid,
+            'webrtc_handle_id': webrtc_handle_id,
+            'webrtc_session_id': webrtc_session_id,
+            'janus_room_id': janus_room_id,
+            'janus_participant_id': janus_participant_id,
         })
 
     async def get_call_status(
@@ -865,7 +902,10 @@ class JanusClient:
             return resp
         except Exception as e:
             if not future.done():
-                future.set_exception(e)
+                # No caller awaits this bookkeeping future when the HTTP
+                # request itself fails; cancelling avoids an unhandled-future
+                # warning while the original exception is re-raised below.
+                future.cancel()
             raise
         finally:
             self._pending.pop(transaction, None)
@@ -892,6 +932,11 @@ class JanusClient:
                 f'Janus videoroom error [{plugin.get("error_code")}]: '
                 f'{plugin.get("error")}'
             )
+        # Depending on gateway timing, the JSEP can be returned directly by
+        # this HTTP request instead of arriving through the long poll.
+        response_jsep = resp.get('jsep')
+        if response_jsep and self.on_jsep:
+            self.on_jsep(response_jsep, resp)
         return resp
 
     async def create(self) -> int:
@@ -935,6 +980,12 @@ class JanusClient:
             'streams': streams,
         })
 
+    async def list_participants(self) -> list[dict]:
+        """Return the current Janus room participants."""
+        resp = await self._message({'request': 'listparticipants'})
+        data = (resp.get('plugindata') or {}).get('data') or {}
+        return data.get('participants') or []
+
     async def subscribe(self, streams: list) -> None:
         await self._message({'request': 'subscribe', 'streams': streams})
 
@@ -968,11 +1019,7 @@ class JanusClient:
         # it as `undefined` (dropped by JSON.stringify).
         if ice_restart:
             payload['restart'] = True
-        resp = await self._message(payload, jsep={'type': 'offer', 'sdp': sdp})
-        # The answer may ride along on the configure response.
-        jsep = resp.get('jsep')
-        if jsep and self.on_jsep:
-            self.on_jsep(jsep, resp)
+        await self._message(payload, jsep={'type': 'offer', 'sdp': sdp})
 
     async def send_sdp_answer(self, sdp: str) -> dict:
         """Answer the server's SDP offer (subscriber side, `start`)."""
@@ -994,14 +1041,14 @@ class JanusClient:
                     {'janus': 'detach'},
                     suffix=f'{self.session_id}/{self.handler_id}'
                 )
-            except SpaceError:
+            except Exception:
                 pass
 
     async def destroy(self) -> None:
         if self.session_id is not None:
             try:
                 await self._dispatch({'janus': 'destroy'}, suffix=str(self.session_id))
-            except SpaceError:
+            except Exception:
                 pass
             self.session_id = None
 
@@ -1108,6 +1155,7 @@ class SpaceVoiceSession:
         periscope_user_id: str = '',
         room_id: str = '',
         http: _Http | None = None,
+        on_audio_track=None,
     ):
         self._http = http or _Http()
         self.periscope_user_id = periscope_user_id
@@ -1125,7 +1173,12 @@ class SpaceVoiceSession:
         self._publisher_future: asyncio.Future | None = None
         self._streams: list[dict] = []
         self._connected = asyncio.Event()
+        self._negotiation_failed = asyncio.Event()
+        self._negotiation_error: Exception | None = None
+        self._jsep_tasks: set[asyncio.Task] = set()
+        self._seen_jsep: set[tuple[str, str]] = set()
         self.remote_audio = None  # aiortc AudioStreamTrack when listening
+        self.on_audio_track = on_audio_track
 
     def _require_aiortc(self):
         try:
@@ -1211,6 +1264,10 @@ class SpaceVoiceSession:
         self.pc = self._make_peer_connection(aiortc, ice_servers)
         self.pc.on('track', self._on_track)
         self.pc.on('iceconnectionstatechange', self._on_ice_state)
+        self.pc.on('connectionstatechange', self._on_connection_state)
+        # Janus delivers videoroom events and SDP exclusively through the
+        # long poll.  It must be running before join/configure messages.
+        self.janus.start_polling()
 
         if as_publisher:
             if create_room:
@@ -1235,7 +1292,7 @@ class SpaceVoiceSession:
             if self._subscriber_handle is not None and publisher_id is not None:
                 try:
                     await self._subscriber_handle.join_as_subscriber(
-                        [{'feed_id': publisher_id, 'mid': '0'}]
+                        [{'feed': publisher_id, 'mid': '0'}]
                     )
                 except SpaceError:
                     pass
@@ -1256,30 +1313,45 @@ class SpaceVoiceSession:
                 vid_man_token=self.janus.vid_man_token,
             )
         else:
-            await self.janus.join_as_subscriber(streams or [])
-            # A listener still needs an audio transceiver or createOffer()
-            # produces an SDP with no media section and Janus answers 465
-            # (Missing mandatory lines).
-            try:
-                self.pc.addTransceiver('audio', direction='recvonly')
-            except Exception:
-                pass
-            await asyncio.sleep(0.2)
-            offer = await self.pc.createOffer()
-            await self.pc.setLocalDescription(offer)
-            await self.janus.send_sdp_offer(
-                offer.sdp,
-                stream_name=self.stream_name,
-                session_uuid=self.session_uuid,
-                vid_man_token=self.janus.vid_man_token,
-            )
+            self.pc.addTransceiver('audio', direction='recvonly')
+            normalized = _normalize_audio_streams(streams or [])
+            if not normalized:
+                participants = await self.janus.list_participants()
+                normalized = [
+                    {'feed': p['id'], 'mid': '0'}
+                    for p in participants
+                    if p.get('publisher') and p.get('id') is not None
+                ]
+            if not normalized:
+                raise SpaceError('no active audio publisher in the Space')
+            # Subscriber negotiation is server-driven: join makes Janus send
+            # an SDP offer through long polling; _apply_remote_jsep answers it
+            # and completes the videoroom `start` request.
+            await self.janus.join_as_subscriber(normalized)
 
-        self.janus.start_polling()
-        # Wait for ICE to come up (bounded; some setups take a few seconds).
-        try:
-            await asyncio.wait_for(self._connected.wait(), timeout=20)
-        except asyncio.TimeoutError:
-            pass
+        # ICE completion alone is not enough: DTLS may remain stuck in
+        # `connecting`, yielding a track object but never any RTP frames.
+        connected = asyncio.create_task(self._connected.wait())
+        failed = asyncio.create_task(self._negotiation_failed.wait())
+        done, pending = await asyncio.wait(
+            {connected, failed}, timeout=25,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        if failed in done and self._negotiation_error is not None:
+            error = self._negotiation_error
+            await self.close()
+            raise SpaceError(
+                f'WebRTC SDP negotiation failed: {error}'
+            ) from error
+        if connected not in done:
+            role = 'publisher' if as_publisher else 'listener'
+            await self.close()
+            raise SpaceError(
+                f'{role} WebRTC/DTLS negotiation timed out'
+            )
 
     def _resolve_publisher(self, pid: int):
         self.publisher_id = pid
@@ -1297,32 +1369,65 @@ class SpaceVoiceSession:
     def _on_jsep(self, jsep: dict, event: dict = None):
         if self.pc is None:
             return
-        sdp = jsep.get('sdp')
-        if not sdp:
-            return
+        task = asyncio.create_task(self._apply_remote_jsep(jsep))
+        self._jsep_tasks.add(task)
+        task.add_done_callback(self._finish_jsep_task)
+
+    def _finish_jsep_task(self, task: asyncio.Task) -> None:
+        self._jsep_tasks.discard(task)
         try:
-            import aiortc
-            asyncio.create_task(
-                self.pc.setRemoteDescription(
-                    aiortc.RTCSessionDescription(sdp=sdp, type=jsep.get('type', 'answer'))
-                )
-            )
-        except Exception:
-            pass
+            task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            if self._negotiation_error is None:
+                self._negotiation_error = exc
+                self._negotiation_failed.set()
+
+    async def _apply_remote_jsep(self, jsep: dict) -> None:
+        sdp = jsep.get('sdp')
+        if not sdp or self.pc is None:
+            return
+        aiortc = self._require_aiortc()
+        jsep_type = jsep.get('type', 'answer')
+        key = (jsep_type, sdp)
+        if key in self._seen_jsep:
+            return
+        self._seen_jsep.add(key)
+        await self.pc.setRemoteDescription(
+            aiortc.RTCSessionDescription(sdp=sdp, type=jsep_type)
+        )
+        if jsep_type == 'offer':
+            answer = await self.pc.createAnswer()
+            await self.pc.setLocalDescription(answer)
+            await self.janus.send_sdp_answer(self.pc.localDescription.sdp)
 
     def _on_track(self, track):
         self.remote_audio = track
+        if self.on_audio_track is not None:
+            self.on_audio_track(track)
         if self.pc is not None:
             self.pc.iceConnectionState  # touch
 
     def _on_ice_state(self):
+        # Kept as a hook for callers/debugging. Readiness is signalled by
+        # the aggregate PeerConnection state below, after DTLS is ready.
+        return None
+
+    def _on_connection_state(self):
         try:
-            if self.pc.iceConnectionState in ('connected', 'completed'):
+            if self.pc.connectionState == 'connected':
                 self._connected.set()
         except Exception:
             pass
 
     async def close(self):
+        tasks = list(self._jsep_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._jsep_tasks.clear()
         if self.pc is not None:
             await self.pc.close()
             self.pc = None
@@ -1497,6 +1602,7 @@ class Spaces:
         self.proxsee = ProxseeApi(client)
         self.chatman = ChatmanApi(client)
         self._http = _Http()
+        self._host_sessions: dict[str, str] = {}
 
     # -- metadata / discovery ----------------------------------------------
 
@@ -1512,8 +1618,16 @@ class Spaces:
     async def get_space_by_url(self, url: str, **kwargs) -> Space:
         return await self.get_space(_extract_space_id(url), **kwargs)
 
-    async def search(self, query: str, filter: str = 'Live') -> list[Space]:
-        """Search Spaces. `filter` is one of 'Top' / 'Live' / 'Upcoming'."""
+    async def search(
+        self, query: str, filter: str = 'Live', *, hydrate: bool = True
+    ) -> list[Space]:
+        """Search Spaces. ``filter`` is ``Top``, ``Live`` or ``Upcoming``.
+
+        X's current search payload contains only each Space's ``rest_id``.
+        By default the ids are hydrated concurrently through
+        :meth:`get_space`, so fields such as ``title`` and ``state`` are
+        populated. Pass ``hydrate=False`` for the cheaper id-only response.
+        """
         data, _ = await self._client.gql.audio_space_search(
             query, filter=filter
         )
@@ -1529,10 +1643,22 @@ class Spaces:
             for item in section.get('items') or []:
                 space_data = item.get('space')
                 if space_data:
-                    # the search payload is a bare metadata dict, not the
-                    # full audioSpace object
-                    spaces.append(Space({'metadata': space_data}))
-        return spaces
+                    metadata = space_data.get('metadata') or space_data
+                    spaces.append(Space({'metadata': metadata}))
+        if not hydrate:
+            return spaces
+
+        async def hydrate_one(space: Space) -> Space:
+            if not space.id:
+                return space
+            try:
+                return await self.get_space(space.id)
+            except Exception:
+                # A live result can end/disappear between the grouped search
+                # and AudioSpaceById; retain its id rather than dropping it.
+                return space
+
+        return list(await asyncio.gather(*(hydrate_one(s) for s in spaces)))
 
     async def topics(self) -> list[dict]:
         data, _ = await self._client.gql.browse_space_topics()
@@ -1683,21 +1809,32 @@ class Spaces:
         tears down the broadcast. `space_id` here is the proxsee broadcast id
         (from create_space) or the X space id.
         """
-        space = await self.get_space(space_id)
-        chat_token = None
-        if space.media_key:
-            stream = await self.get_stream(space.media_key)
-            chat_token = stream.chat_token
-        if chat_token:
-            await self.chatman.initialize(chat_token)
-            try:
-                await self.chatman.end_audio_space(space_id)
-            except SpaceError:
-                pass
+        # Chat shutdown is useful, but must never prevent the authoritative
+        # proxsee endBroadcast call. Metadata/stream resolution can fail
+        # transiently while a newly-created Space is still propagating.
         try:
-            await self.proxsee.end_broadcast(space_id)
-        except SpaceError:
+            space = await self.get_space(space_id)
+            if space.media_key:
+                stream = await self.get_stream(space.media_key)
+                if stream.chat_token:
+                    await self.chatman.initialize(stream.chat_token)
+                    await self.chatman.end_audio_space(space_id)
+        except Exception:
             pass
+
+        # A dropped connection here otherwise leaves a real Space Running.
+        # Retry only transport errors; API errors retain the old best-effort
+        # behaviour (an already-ended broadcast commonly rejects repeats).
+        for attempt in range(3):
+            try:
+                await self.proxsee.end_broadcast(space_id)
+                break
+            except SpaceError:
+                break
+            except Exception:
+                if attempt == 2:
+                    raise
+                await asyncio.sleep(1 + attempt)
 
     async def cancel_scheduled_space(self, broadcast_id: str) -> None:
         await self.proxsee.login()
@@ -1764,7 +1901,7 @@ class Spaces:
         space_id = await self._ensure_chatman(space)
         return await self.chatman.join_as_speaker(
             space_id,
-            join_as_admin=join_as_admin or as_speaker,
+            join_as_admin=join_as_admin,
             should_auto_join=should_auto_join,
         )
 
@@ -1783,11 +1920,10 @@ class Spaces:
         aiortc). Returns a SpaceVoiceSession with `.pc` (RTCPeerConnection)
         and `.publisher_id`.
 
-        ``audio_track`` is an optional aiortc AudioStreamTrack whose
+        ``audio_track`` is an aiortc AudioStreamTrack whose
         ``recv()`` returns 48 kHz stereo AudioFrames; it is added before the
-        initial SDP offer. ``on_audio_track`` (legacy) is a callback
-        receiving the session and returning a track, added right after the
-        first offer (triggers a renegotiation).
+        initial SDP offer. ``on_audio_track`` (legacy) is a callback receiving
+        the session and returning that track before the first offer.
 
         Pass ``session_uuid`` to reuse an existing chatman session (e.g.
         after the host approved your raise-hand request — joining again
@@ -1823,8 +1959,12 @@ class Spaces:
             room_id=sp.id or '',
             http=self._http,
         )
-        if on_audio_track is not None:
-            session.pc = None  # replaced inside connect via _require_aiortc
+        if audio_track is None and on_audio_track is not None:
+            audio_track = on_audio_track(session)
+        if audio_track is None:
+            raise SpaceError(
+                'speak() requires audio_track or an on_audio_track callback'
+            )
         await session.connect(
             ice_servers,
             as_publisher=True,
@@ -1843,20 +1983,6 @@ class Spaces:
             await self.chatman.publish_stream(session_uuid)
         except SpaceError:
             pass
-        if on_audio_track is not None and audio_track is None:
-            track = on_audio_track(session)
-            if track is not None:
-                session.pc.addTransceiver(track, direction='sendonly')
-                await session.pc.setLocalDescription(
-                    await session.pc.createOffer()
-                )
-                await session.janus.send_sdp_offer(
-                    session.pc.localDescription.sdp,
-                    descriptions=[session.pc.localDescription.sdp],
-                    stream_name=sp.id or '',
-                    session_uuid=session_uuid,
-                    vid_man_token=janus_jwt,
-                )
         return session
 
     async def host(
@@ -1871,10 +1997,11 @@ class Spaces:
         Open the host voice session for a Space created by
         :meth:`create_space` (the creator's own WebRTC publish path).
 
-        ``created`` is the return value of ``create_space()`` — it carries
-        the Janus gateway URL, credential and stream name that only the
-        createBroadcast response contains (there is no way to re-fetch
-        them later; ``audiospace/join`` is 403 for the host).
+        ``created`` is the return value of ``create_space()``. Its broadcast
+        id is passed to ``reconnectHost`` to obtain a fresh host session UUID
+        and Janus credentials (``audiospace/join`` is 403 for the host).
+        ``audio_track`` is required; use ``create_space()`` alone when no
+        live audio is needed.
 
         The full web-client host flow is applied: attach a second
         videoroom handle and subscribe to the host's own feed (prevents
@@ -1887,19 +2014,30 @@ class Spaces:
         broadcast_id = broadcast.get('id') or resp.get('broadcast_id')
         if not broadcast_id:
             raise SpaceError('create_space response has no broadcast id')
+        if audio_track is None:
+            raise SpaceError('host() requires an audio_track')
         if ice_servers is None:
             # Direct connection by default (see speak() for the TURN note).
             ice_servers = []
+        # The current web client reconnects the host before opening media.
+        # Besides fresh Janus credentials this supplies the host's real
+        # Chatman session UUID, required by moderation and stream bookkeeping.
         try:
-            await self.chatman.initialize(resp.get('access_token') or '')
+            reconnected = await self.proxsee.reconnect_host(broadcast_id)
         except SpaceError:
-            pass
+            reconnected = {}
+        host_details = {**resp, **reconnected}
+        host_broadcast = reconnected.get('broadcast') or broadcast
+        session_uuid = host_details.get('session_uuid') or ''
+        if session_uuid:
+            self._host_sessions[broadcast_id] = session_uuid
+        await self.chatman.initialize(host_details.get('access_token') or '')
 
         session = SpaceVoiceSession(
-            janus_url=resp.get('webrtc_gw_url') or '',
-            vid_man_token=resp.get('credential') or '',
-            stream_name=resp.get('stream_name') or broadcast_id,
-            session_uuid='',
+            janus_url=host_details.get('webrtc_gw_url') or '',
+            vid_man_token=host_details.get('credential') or '',
+            stream_name=host_details.get('stream_name') or broadcast_id,
+            session_uuid=session_uuid,
             display=self.proxsee.periscope_user_id or '',
             periscope_user_id=self.proxsee.periscope_user_id or '',
             room_id=broadcast_id,
@@ -1918,7 +2056,7 @@ class Spaces:
             try:
                 payload = {
                     'broadcast_id': broadcast_id,
-                    'status': broadcast.get('title') or '',
+                    'status': host_broadcast.get('title') or '',
                     'topics': [],
                     'conversation_controls': 0,
                     'mentioned_twitter_user_ids': [],
@@ -1934,11 +2072,11 @@ class Spaces:
         # Host bookkeeping right after the SDP offer (web client does the
         # same): unmute (hosts start auto-muted) + stream/publish.
         try:
-            await self.chatman.unmute_speaker('', broadcast_id)
+            await self.chatman.unmute_speaker(session_uuid, broadcast_id)
         except SpaceError:
             pass
         try:
-            await self.chatman.publish_stream('')
+            await self.chatman.publish_stream(session_uuid)
         except SpaceError:
             pass
         return session
@@ -1949,39 +2087,56 @@ class Spaces:
         *,
         on_audio_track=None,
         ice_servers: list[dict] | None = None,
+        attempts: int = 3,
     ) -> SpaceVoiceSession:
         """
         Join as listener and open a WebRTC receive session (requires
         aiortc). Simpler listening can be done with HLS: see `stream_url()`
         + ffmpeg.
         """
-        joined = await self.join(space, as_speaker=False, should_auto_join=True)
-        session_uuid = joined.get('session_uuid')
-        if not session_uuid:
-            raise SpaceError(f'join returned no session_uuid: {joined}')
-        neg = await self.chatman.negotiate_stream(session_uuid)
-        janus_jwt = neg.get('janus_jwt') or neg.get('janusJwt')
-        webrtc_gw_url = neg.get('webrtc_gw_url') or neg.get('webrtcGwUrl')
         if ice_servers is None:
             # Direct connection by default (see speak() for the TURN note).
             ice_servers = []
-        status = await self.chatman.get_call_status(
-            (space.id if isinstance(space, Space) else space)
-        )
-        streams = _extract_audio_streams(status)
         sid = space.id if isinstance(space, Space) else space
-        session = SpaceVoiceSession(
-            janus_url=webrtc_gw_url,
-            vid_man_token=janus_jwt,
-            stream_name=sid or '',
-            session_uuid=session_uuid,
-            periscope_user_id=self.proxsee.periscope_user_id or '',
-            room_id=sid or '',
-        )
-        await session.connect(
-            ice_servers, as_publisher=False, streams=streams
-        )
-        return session
+        attempts = max(1, attempts)
+        last_error = None
+        for attempt in range(attempts):
+            session = None
+            try:
+                joined = await self.join(
+                    space, as_speaker=False, should_auto_join=True
+                )
+                session_uuid = joined.get('session_uuid')
+                if not session_uuid:
+                    raise SpaceError(
+                        f'join returned no session_uuid: {joined}'
+                    )
+                neg = await self.chatman.negotiate_stream(session_uuid)
+                janus_jwt = neg.get('janus_jwt') or neg.get('janusJwt')
+                webrtc_gw_url = (
+                    neg.get('webrtc_gw_url') or neg.get('webrtcGwUrl')
+                )
+                session = SpaceVoiceSession(
+                    janus_url=webrtc_gw_url,
+                    vid_man_token=janus_jwt,
+                    stream_name=sid or '',
+                    session_uuid=session_uuid,
+                    periscope_user_id=self.proxsee.periscope_user_id or '',
+                    room_id=sid or '',
+                    http=self._http,
+                )
+                await session.connect(ice_servers, as_publisher=False)
+                if on_audio_track is not None and \
+                        session.remote_audio is not None:
+                    on_audio_track(session.remote_audio)
+                return session
+            except Exception as exc:
+                last_error = exc
+                if session is not None:
+                    await session.close()
+                if attempt + 1 < attempts:
+                    await asyncio.sleep(1 + attempt)
+        raise last_error
 
     # -- chat --------------------------------------------------------------
 
@@ -2095,14 +2250,17 @@ class Spaces:
     ) -> dict:
         """Promote a participant to co-host."""
         await self._ensure_chatman(space_id)
-        return await self.chatman.add_admin(space_id, session_uuid, user_id)
+        return await self.chatman.add_admin(space_id, user_id)
 
     async def remove_admin(
         self, space_id: str, user_id: str, session_uuid: str = ''
     ) -> dict:
         """Demote a co-host back to a regular participant."""
         await self._ensure_chatman(space_id)
-        return await self.chatman.remove_admin(space_id, session_uuid, user_id)
+        host_session = session_uuid or self._host_sessions.get(space_id, '')
+        return await self.chatman.remove_admin(
+            space_id, host_session, user_id
+        )
 
     async def mute_speaker(self, space_id: str, session_uuid: str) -> dict:
         return await self.chatman.mute_speaker(session_uuid, space_id)
@@ -2212,7 +2370,11 @@ class Spaces:
         )
 
     async def aclose(self) -> None:
-        await self._http.aclose()
+        await asyncio.gather(
+            self._http.aclose(),
+            self.proxsee._http.aclose(),
+            self.chatman._http.aclose(),
+        )
 
 
 def _extract_space_id(value: str) -> str:
@@ -2223,24 +2385,15 @@ def _extract_space_id(value: str) -> str:
     return value
 
 
-def _extract_audio_streams(call_status: dict) -> list[dict]:
-    """Best-effort extraction of audio streams for the subscriber join."""
-    def walk(obj):
-        if isinstance(obj, dict):
-            if isinstance(obj.get('streams'), list):
-                for s in obj['streams']:
-                    if isinstance(s, dict):
-                        yield s
-            for v in obj.values():
-                yield from walk(v)
-        elif isinstance(obj, list):
-            for v in obj:
-                yield from walk(v)
-
-    streams = list(walk(call_status))
-    # Prefer entries that look like actual media streams.
-    audio = [
-        s for s in streams
-        if s.get('type') in ('audio', None)
-    ]
-    return audio or streams
+def _normalize_audio_streams(streams: list[dict]) -> list[dict]:
+    """Convert API/Janus stream records to the subscriber join shape."""
+    normalized = []
+    for stream in streams:
+        feed = stream.get('feed') or stream.get('feed_id') or stream.get('id')
+        if feed is None:
+            continue
+        normalized.append({
+            'feed': feed,
+            'mid': str(stream.get('mid') or stream.get('feed_mid') or '0'),
+        })
+    return normalized

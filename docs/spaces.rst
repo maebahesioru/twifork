@@ -55,7 +55,9 @@ Reference
 
 Metadata / discovery
     - :meth:`twikit.spaces.Spaces.get_space` / ``get_space_by_url``
-    - :meth:`twikit.spaces.Spaces.search`
+    - :meth:`twikit.spaces.Spaces.search` — hydrates the id-only search
+      results by default; use ``hydrate=False`` to avoid the additional
+      ``AudioSpaceById`` requests when only ids are needed.
     - :meth:`twikit.spaces.Spaces.topics`
 
 Broadcast lifecycle
@@ -70,8 +72,11 @@ Broadcast lifecycle
 Streaming
     - :meth:`twikit.spaces.Spaces.get_stream` — HLS url + chat token from a
       media key.
-    - :meth:`twikit.spaces.Spaces.speak` / ``listen`` — WebRTC voice
-      (requires ``aiortc``; experimental).
+    - :meth:`twikit.spaces.Spaces.host` — publish the creator's audio after
+      ``create_space``; pass that method's response plus an audio track.
+    - :meth:`twikit.spaces.Spaces.speak` / ``listen`` — guest publisher and
+      listener WebRTC paths (requires ``aiortc``; experimental). ``listen``
+      retries a failed Janus/DTLS negotiation up to three times by default.
 
 Chat
     - :meth:`twikit.spaces.Spaces.chat` — history over HTTP plus a live
@@ -108,9 +113,11 @@ auth + join control frames).
 
 Measured chat behaviour against the production chatman:
 
-* **History works for live and replay** — ``chat.history()`` returns both
-  the join/presence events and the chat messages that were sent while the
-  Space was live (message bodies come back with ``type`` 1 = Chat).
+* **History works for live and recorded replay** — ``chat.history()``
+  returns both join/presence events and messages sent while the Space was
+  live (message bodies come back with ``type`` 1 = Chat). An ended Space
+  needs an actual recording: setting replay availability without publishing
+  audio does not make X retain a replay chat token.
 * **The history endpoint 404s for the first ~60 seconds** after a Space
   is created. Wait a bit (or retry) before calling ``history()``.
 * **Sending is two-way verified.** ``chat.send()`` broadcasts over the
@@ -134,7 +141,8 @@ Tweet sharing (verified live):
 * The sharing id comes back in ``AudioSpaceById`` as
   ``data.sharings.items[].sharing_id``; ``Space.sharing_ids`` lists them.
 * ``delete_sharing(space_id, sharing_id)`` removes it again (verified:
-  sharing_ids returns to ``[]``).
+  sharing_ids returns to ``[]``). The follow-up ``AudioSpaceById`` read is
+  eventually consistent and can show the removed id for a few seconds.
 * ``associate_tweet_with_broadcast`` (proxsee) links a tweet to the
   broadcast — returns ``{"success": true}``.
 
@@ -147,6 +155,13 @@ Speaking flow (measured):
 * ``raise_hand``/``lower_hand`` (emoji reaction endpoints) return 403 for
   regular accounts — the endpoints appear restricted/deprecated on X's
   side; the speaker-request flow above is the supported path.
+* A host can mute an active speaker. X deliberately refuses a host-side
+  ``unmute_speaker`` with 403; the speaker must call it on their own session
+  to turn their microphone back on. Both directions were verified live.
+* ``stream_eject`` requires the speaker's Chatman session UUID plus their
+  Janus handle, session, room and participant ids. The ids are available on
+  the active :class:`twikit.spaces.SpaceVoiceSession`; a UUID-only payload is
+  rejected by X with HTTP 400.
 
 A full working example lives in ``examples/spaces.py``.
 
@@ -170,10 +185,10 @@ WebRTC voice notes (learned the hard way against the production SFU):
   X's TURN server (``turns:turn.pscp.tv:443``) tears the TLS connection
   down after ~60s, which silently kills the media path and makes the
   SFU drop the publisher. Direct connectivity avoids this entirely.
-* **Hosts must subscribe to their own feed.** ``speak()`` attaches a
-  second videoroom handle on the same Janus session and joins as a
-  subscriber of the host's own stream (mirroring the web client's
-  ``t8`` handle). Without this the backend marks the space
+* **Publishers subscribe to their own feed.** ``host()`` and ``speak()``
+  attach a second videoroom handle on the same Janus session and join as a
+  subscriber of their own stream (mirroring the web client's ``t8``
+  handle). Without this the backend marks the space
   ``TimedOut`` after about two minutes even while media flows.
 * **Pace your audio track.** aiortc sends RTP as fast as
   ``AudioStreamTrack.recv()`` yields frames — it does not pace in real
@@ -187,3 +202,7 @@ WebRTC voice notes (learned the hard way against the production SFU):
   session steals events (the SDP answer gets lost and ICE stays
   ``new``). The session's main handle long-polls and dispatches events
   by ``sender`` handle id.
+* **Wait for DTLS, not only ICE.** ICE can be ``completed`` while the peer
+  connection remains ``connecting`` and receives no RTP. Voice methods only
+  return after ``connectionState == 'connected'``; failed SDP tasks and DTLS
+  timeouts are surfaced as :class:`twikit.spaces.SpaceError`.

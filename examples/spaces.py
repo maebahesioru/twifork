@@ -82,7 +82,9 @@ async def main() -> None:
         print(f'ended {space_id}')
 
     # 6. speak (opt-in, visible): stream a paced sine wave into a live
-    #    Space. Requires `pip install twifork[spaces]`.
+    #    Space as an approved speaker. Hosts use
+    #    `await client.spaces.host(created, audio_track=...)` instead.
+    #    Requires `pip install twifork[spaces]`.
     if os.environ.get('SPACES_SPEAK'):
         space_id = os.environ.get('SPACES_SPEAK')
         import math
